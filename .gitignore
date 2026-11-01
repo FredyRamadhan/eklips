@@ -1,0 +1,60 @@
+# Go build output
+/eklips
+/bin/
+/dist/
+*.exe
+*.test
+
+# Test / coverage / profiling
+*.out
+coverage.*
+*.cover
+*.prof
+cpu.out
+mem.out
+
+# Benchmarks (keep bench/baseline.txt)
+bench/*.new
+bench/*.old
+bench/*.txt
+!bench/baseline.txt
+
+# SQLite state + daemon lock
+*.db
+*.db-wal
+*.db-shm
+*.db.lock
+*.sqlite
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs and temp files
+*.log
+*.tmp
+.tmp/
+tmp/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local Docker data
+/data/
+/music/
+
+# Personal skills
+/.claude/*
+/.agents/*
+.claude/
+.agents/
+skills-lock.json
+
+# Development
+/development/
+development/
