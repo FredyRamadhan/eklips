@@ -1,0 +1,337 @@
+openapi: 3.0.3
+info:
+  title: eklips Control & Streaming API
+  version: 1.0.0
+  description: HTTP API v1 for the eklips headless audio player daemon.
+servers:
+  - url: http://127.0.0.1:8080
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              example: FILE_NOT_FOUND
+            message:
+              type: string
+              example: /music/song.mp3 does not exist
+    Status:
+      type: object
+      required:
+        - state
+        - source_type
+        - source_path
+        - current_track
+        - index
+        - position_ms
+        - duration_ms
+        - volume
+        - muted
+        - shuffle
+        - loop
+        - sink
+        - listeners
+      properties:
+        state:
+          type: string
+          enum: [stopped, playing, paused]
+        source_type:
+          type: string
+          enum: ["", single, playlist]
+        source_path:
+          type: string
+        source_name:
+          type: string
+        current_track:
+          type: string
+        index:
+          type: integer
+        position_ms:
+          type: integer
+          format: int64
+        duration_ms:
+          type: integer
+          format: int64
+        volume:
+          type: integer
+          minimum: 0
+          maximum: 100
+        muted:
+          type: boolean
+        shuffle:
+          type: boolean
+        loop:
+          type: boolean
+        sink:
+          type: string
+          enum: [device, http, both, null]
+        listeners:
+          type: integer
+        last_error:
+          type: string
+    Queue:
+      type: object
+      properties:
+        source_type:
+          type: string
+        source_path:
+          type: string
+        source_name:
+          type: string
+        current_index:
+          type: integer
+        cursor:
+          type: integer
+        shuffle:
+          type: boolean
+        loop:
+          type: boolean
+        play_order:
+          type: array
+          items:
+            type: integer
+        tracks:
+          type: array
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+              path:
+                type: string
+              name:
+                type: string
+              current:
+                type: boolean
+    Alias:
+      type: object
+      properties:
+        name:
+          type: string
+        playlist_path:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+security:
+  - bearerAuth: []
+paths:
+  /api/v1/health:
+    get:
+      summary: Liveness check
+      security: []
+      responses:
+        "200":
+          description: Daemon is healthy
+  /api/v1/status:
+    get:
+      summary: Get current playback and daemon status
+      responses:
+        "200":
+          description: Current status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Status"
+  /api/v1/queue:
+    get:
+      summary: Get loaded queue and play order
+      responses:
+        "200":
+          description: Current queue
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Queue"
+  /api/v1/events:
+    get:
+      summary: Subscribe to Server-Sent Events (SSE)
+      parameters:
+        - in: header
+          name: Last-Event-ID
+          schema:
+            type: string
+      responses:
+        "200":
+          description: text/event-stream of state, track, queue, volume, mute, shuffle, loop, error, and device events
+  /api/v1/stream:
+    get:
+      summary: Live gapless audio/wav PCM stream
+      responses:
+        "200":
+          description: Continuous WAV audio stream
+          content:
+            audio/wav:
+              schema:
+                type: string
+                format: binary
+        "503":
+          description: Too many listeners or sink unavailable
+  /api/v1/play:
+    post:
+      summary: Load and play a file or directory, or resume the loaded queue
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                path:
+                  type: string
+                loop:
+                  type: boolean
+      responses:
+        "200":
+          description: Playback started or resumed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Status"
+  /api/v1/pause:
+    post:
+      summary: Pause active playback
+      responses:
+        "200":
+          description: Playback paused
+  /api/v1/stop:
+    post:
+      summary: Stop playback while retaining queue
+      responses:
+        "200":
+          description: Playback stopped
+  /api/v1/next:
+    post:
+      summary: Advance to next playlist track
+      responses:
+        "200":
+          description: Advanced to next track
+  /api/v1/previous:
+    post:
+      summary: Return to previous playlist track
+      responses:
+        "200":
+          description: Returned to previous track
+  /api/v1/volume/up:
+    post:
+      summary: Increase volume by 5
+      responses:
+        "200":
+          description: Volume increased
+  /api/v1/volume/down:
+    post:
+      summary: Decrease volume by 5
+      responses:
+        "200":
+          description: Volume decreased
+  /api/v1/mute:
+    post:
+      summary: Toggle mute
+      responses:
+        "200":
+          description: Mute toggled
+  /api/v1/shuffle:
+    post:
+      summary: Toggle playlist shuffle
+      responses:
+        "200":
+          description: Shuffle toggled
+  /api/v1/loop:
+    post:
+      summary: Toggle playlist loop
+      responses:
+        "200":
+          description: Loop toggled
+  /api/v1/shutdown:
+    post:
+      summary: Gracefully shut down the daemon
+      responses:
+        "200":
+          description: Shutdown initiated
+  /api/v1/playlists/create:
+    post:
+      summary: Create a template or folder-scanned playlist.json
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                dir:
+                  type: string
+                output:
+                  type: string
+                force:
+                  type: boolean
+      responses:
+        "200":
+          description: Playlist file created
+  /api/v1/playlists/play:
+    post:
+      summary: Load and play a JSON playlist or saved alias
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                target:
+                  type: string
+                loop:
+                  type: boolean
+      responses:
+        "200":
+          description: Playlist playback started
+  /api/v1/aliases:
+    get:
+      summary: List all playlist aliases
+      responses:
+        "200":
+          description: List of aliases
+  /api/v1/aliases/{name}:
+    put:
+      summary: Create or update a playlist alias
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path:
+                  type: string
+      responses:
+        "200":
+          description: Alias saved
+    delete:
+      summary: Delete a playlist alias
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Alias deleted

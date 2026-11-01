@@ -21,7 +21,7 @@ func NewResampler(src Source, outRate int) *Resampler {
 	return &Resampler{
 		src:  src,
 		step: float64(src.SampleRate()) / float64(outRate),
-		buf:  make([]float32, 0, 4096*Channels),
+		buf:  make([]float32, 4096*Channels),
 	}
 }
 

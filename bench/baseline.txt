@@ -1,0 +1,48 @@
+goos: linux
+goarch: amd64
+pkg: github.com/frdn/eklips/internal/audio
+cpu: Intel(R) Core(TM) i7-7600U CPU @ 2.80GHz
+BenchmarkDecodeWAV-4          	    2659	    414534 ns/op	 425.54 MB/s	   70616 B/op	      17 allocs/op
+BenchmarkDecodeWAV-4          	    2601	    426197 ns/op	 413.89 MB/s	   70616 B/op	      17 allocs/op
+BenchmarkDecodeWAV-4          	    2889	    412745 ns/op	 427.38 MB/s	   70616 B/op	      17 allocs/op
+BenchmarkResample48kTo44k-4   	    1426	    808716 ns/op	 218.12 MB/s	  115784 B/op	      19 allocs/op
+BenchmarkResample48kTo44k-4   	    1596	    727526 ns/op	 242.47 MB/s	  115784 B/op	      19 allocs/op
+BenchmarkResample48kTo44k-4   	    1621	    702173 ns/op	 251.22 MB/s	  115784 B/op	      19 allocs/op
+PASS
+ok  	github.com/frdn/eklips/internal/audio	8.222s
+goos: linux
+goarch: amd64
+pkg: github.com/frdn/eklips/internal/sink
+cpu: Intel(R) Core(TM) i7-7600U CPU @ 2.80GHz
+BenchmarkBroadcasterFanOut10-4   	 1631655	       691.8 ns/op	5100.10 MB/s	       0 B/op	       0 allocs/op
+BenchmarkBroadcasterFanOut10-4   	 1750248	       724.9 ns/op	4867.09 MB/s	       0 B/op	       0 allocs/op
+BenchmarkBroadcasterFanOut10-4   	 1737096	       699.7 ns/op	5041.91 MB/s	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/frdn/eklips/internal/sink	5.757s
+goos: linux
+goarch: amd64
+pkg: github.com/frdn/eklips/internal/engine
+cpu: Intel(R) Core(TM) i7-7600U CPU @ 2.80GHz
+BenchmarkGaplessSplice-4   	    7692	    143986 ns/op	  332900 B/op	      50 allocs/op
+BenchmarkGaplessSplice-4   	    7101	    145941 ns/op	  330887 B/op	      50 allocs/op
+BenchmarkGaplessSplice-4   	    8030	    157643 ns/op	  338373 B/op	      51 allocs/op
+PASS
+ok  	github.com/frdn/eklips/internal/engine	3.475s
+goos: linux
+goarch: amd64
+pkg: github.com/frdn/eklips/internal/store
+cpu: Intel(R) Core(TM) i7-7600U CPU @ 2.80GHz
+BenchmarkStoreSavePlayback-4   	   24291	     48361 ns/op	     704 B/op	      14 allocs/op
+BenchmarkStoreSavePlayback-4   	   34189	     44201 ns/op	     704 B/op	      14 allocs/op
+BenchmarkStoreSavePlayback-4   	   27859	     43808 ns/op	     704 B/op	      14 allocs/op
+PASS
+ok  	github.com/frdn/eklips/internal/store	5.307s
+goos: linux
+goarch: amd64
+pkg: github.com/frdn/eklips/internal/tui
+cpu: Intel(R) Core(TM) i7-7600U CPU @ 2.80GHz
+BenchmarkTUIUpdateAndView-4   	    9572	    107451 ns/op	   22727 B/op	     351 allocs/op
+BenchmarkTUIUpdateAndView-4   	   10000	    105430 ns/op	   22727 B/op	     351 allocs/op
+BenchmarkTUIUpdateAndView-4   	   10000	    102339 ns/op	   22727 B/op	     351 allocs/op
+PASS
+ok  	github.com/frdn/eklips/internal/tui	3.153s

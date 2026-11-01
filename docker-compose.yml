@@ -1,0 +1,33 @@
+services:
+  eklips:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: eklips:latest
+    container_name: eklips
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      EKLIPS_DB: /data/eklips.db
+      EKLIPS_SINK: http
+      EKLIPS_BIND: 0.0.0.0
+      EKLIPS_PORT: 8080
+      # Set EKLIPS_TOKEN to require bearer token authentication from remote CLI/TUI clients:
+      EKLIPS_TOKEN: ${EKLIPS_TOKEN:-}
+    volumes:
+      - eklips_data:/data
+      - ./music:/music:ro
+    # Optional host audio device passthrough (--sink=device or --sink=both):
+    # devices:
+    #   - /dev/snd:/dev/snd
+    # command: ["serve", "--sink=both", "--bind=0.0.0.0", "--port=8080", "--db=/data/eklips.db"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/v1/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  eklips_data:
