@@ -62,6 +62,9 @@ func Run(ctx context.Context, cfg config.Config, in, out *os.File) error {
 	}()
 
 	model := NewModel(ctx, cl)
+	if cfg.Theme != "" && !model.SetTheme(cfg.Theme) {
+		model.infoBanner = "unknown theme " + cfg.Theme + "; using default"
+	}
 	defer model.Close()
 
 	p := tea.NewProgram(

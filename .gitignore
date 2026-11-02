@@ -58,3 +58,5 @@ skills-lock.json
 # Development
 /development/
 development/
+
+.ignore

@@ -380,6 +380,213 @@ func (m *Machine) Advance() bool {
 	return true
 }
 
+// SelectIndex makes the track at index in Source.Tracks current and returns
+// EffectStart. Selecting a track while stopped begins playback.
+func (m *Machine) SelectIndex(index int) (Effect, error) {
+	if !m.Loaded() {
+		return EffectNone, apperr.New(apperr.NoMediaLoaded, "nothing is loaded")
+	}
+	if index < 0 || index >= len(m.src.Tracks) {
+		return EffectNone, apperr.New(apperr.InvalidCommand, "track index %d is out of range", index)
+	}
+	if m.state == Stopped {
+		m.state = Playing
+	}
+	for i, ti := range m.order {
+		if ti == index {
+			m.cursor = i
+			m.gen++
+			return EffectStart, nil
+		}
+	}
+	// Defensive fallback: repair the order and select the requested track.
+	m.order = identity(len(m.src.Tracks))
+	m.cursor = index
+	m.gen++
+	return EffectStart, nil
+}
+
+// RemoveTrack removes the track at index from the queue. When a non-current
+// track is removed, playback continues uninterrupted. Removing the current
+// track selects the following track (or clears an empty queue).
+func (m *Machine) RemoveTrack(index int) (Effect, error) {
+	if !m.Loaded() {
+		return EffectNone, apperr.New(apperr.NoMediaLoaded, "nothing is loaded")
+	}
+	if index < 0 || index >= len(m.src.Tracks) {
+		return EffectNone, apperr.New(apperr.InvalidCommand, "track index %d is out of range", index)
+	}
+	oldCurrent := m.TrackIndex()
+	wasStopped := m.state == Stopped
+
+	tracks := make([]string, 0, len(m.src.Tracks)-1)
+	for i, p := range m.src.Tracks {
+		if i != index {
+			tracks = append(tracks, p)
+		}
+	}
+	if len(tracks) == 0 {
+		m.src = Source{}
+		m.order = nil
+		m.cursor = 0
+		m.state = Stopped
+		m.gen++
+		return EffectStop, nil
+	}
+
+	order := make([]int, 0, len(m.order)-1)
+	for _, ti := range m.order {
+		if ti == index {
+			continue
+		}
+		if ti > index {
+			ti--
+		}
+		order = append(order, ti)
+	}
+	m.src.Tracks = tracks
+	m.order = order
+	m.gen++
+
+	if oldCurrent == index {
+		if m.cursor >= len(order) {
+			m.cursor = len(order) - 1
+		}
+		if m.cursor < 0 {
+			m.cursor = 0
+		}
+		if wasStopped {
+			m.state = Stopped
+			return EffectNone, nil
+		}
+		return EffectStart, nil
+	}
+	cur := oldCurrent
+	if cur > index {
+		cur--
+	}
+	m.cursor = indexOf(order, cur)
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+	return EffectNone, nil
+}
+
+// MoveTrack moves the track at fromIndex so that it ends up at toIndex.
+// Playback of the current track is preserved.
+func (m *Machine) MoveTrack(fromIndex, toIndex int) (Effect, error) {
+	if !m.Loaded() {
+		return EffectNone, apperr.New(apperr.NoMediaLoaded, "nothing is loaded")
+	}
+	n := len(m.src.Tracks)
+	if fromIndex < 0 || fromIndex >= n || toIndex < 0 || toIndex >= n {
+		return EffectNone, apperr.New(apperr.InvalidCommand, "track indices %d -> %d are out of range", fromIndex, toIndex)
+	}
+	if fromIndex == toIndex {
+		return EffectNone, nil
+	}
+	current := m.TrackIndex()
+
+	tracks := append([]string(nil), m.src.Tracks...)
+	moved := tracks[fromIndex]
+	tracks = append(tracks[:fromIndex], tracks[fromIndex+1:]...)
+	tracks = append(tracks, "")
+	copy(tracks[toIndex+1:], tracks[toIndex:])
+	tracks[toIndex] = moved
+
+	// Map old track indices to their new positions.
+	mapping := make([]int, n)
+	for old := range mapping {
+		switch {
+		case old == fromIndex:
+			mapping[old] = toIndex
+		case fromIndex < toIndex && old > fromIndex && old <= toIndex:
+			mapping[old] = old - 1
+		case toIndex < fromIndex && old >= toIndex && old < fromIndex:
+			mapping[old] = old + 1
+		default:
+			mapping[old] = old
+		}
+	}
+	order := make([]int, len(m.order))
+	for i, ti := range m.order {
+		order[i] = mapping[ti]
+	}
+	m.src.Tracks = tracks
+	m.order = order
+	if current >= 0 {
+		m.cursor = indexOf(order, mapping[current])
+		if m.cursor < 0 {
+			m.cursor = 0
+		}
+	}
+	if !m.shuffle {
+		m.order = identity(n)
+		m.cursor = mapping[current]
+	}
+	m.gen++
+	return EffectNone, nil
+}
+
+// Clear empties the queue and stops playback.
+func (m *Machine) Clear() Effect {
+	won := m.state != Stopped || m.Loaded()
+	m.src = Source{}
+	m.order = nil
+	m.cursor = 0
+	m.state = Stopped
+	m.gen++
+	if won {
+		return EffectStop
+	}
+	return EffectNone
+}
+
+// AppendTracks appends paths to the loaded queue. A single-file source becomes
+// a playlist queue. It returns EffectStart when nothing was previously loaded.
+func (m *Machine) AppendTracks(paths []string) (Effect, error) {
+	if len(paths) == 0 {
+		return EffectNone, nil
+	}
+	if !m.Loaded() {
+		m.src = Source{Type: Playlist, Name: "Queue", Tracks: append([]string(nil), paths...)}
+		m.order = identity(len(paths))
+		m.cursor = 0
+		m.state = Playing
+		m.gen++
+		return EffectStart, nil
+	}
+	if m.src.Type == Single {
+		m.src.Type = Playlist
+	}
+	start := len(m.src.Tracks)
+	m.src.Tracks = append(m.src.Tracks, paths...)
+	if m.shuffle {
+		rest := make([]int, len(paths))
+		for i := range rest {
+			rest[i] = start + i
+		}
+		m.rng.Shuffle(len(rest), func(i, j int) { rest[i], rest[j] = rest[j], rest[i] })
+		m.order = append(m.order, rest...)
+	} else {
+		m.order = append(m.order, identity(len(paths))...)
+		for i := range m.order[start:] {
+			m.order[start+i] += start
+		}
+	}
+	m.gen++
+	return EffectNone, nil
+}
+
+func indexOf(s []int, v int) int {
+	for i, x := range s {
+		if x == v {
+			return i
+		}
+	}
+	return -1
+}
+
 // ForcePause pauses if playing (used for device changes). It reports whether
 // the state changed.
 func (m *Machine) ForcePause() bool {

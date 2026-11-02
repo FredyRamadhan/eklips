@@ -39,6 +39,9 @@ type Store struct {
 	stmtSavePlay    *sql.Stmt
 	stmtLoadPlay    *sql.Stmt
 	stmtListAliases *sql.Stmt
+
+	stmtListPlaylists *sql.Stmt
+	stmtDelPlaylist   *sql.Stmt
 }
 
 // Alias maps a name to a playlist file.
@@ -47,6 +50,14 @@ type Alias struct {
 	PlaylistPath string    `json:"playlist_path"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+// PlaylistInfo summarises a saved playlist.
+type PlaylistInfo struct {
+	Name       string    `json:"name"`
+	SourcePath string    `json:"source_path"`
+	TrackCount int       `json:"track_count"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 // Playback is the persisted playback state row.
@@ -292,6 +303,10 @@ func (s *Store) prepare() error {
 	s.stmtGetAlias = p("SELECT name, playlist_path, created_at, updated_at FROM aliases WHERE name = ?")
 	s.stmtDelAlias = p("DELETE FROM aliases WHERE name = ?")
 	s.stmtListAliases = p("SELECT name, playlist_path, created_at, updated_at FROM aliases ORDER BY name")
+	s.stmtListPlaylists = p(`SELECT p.name, p.source_path, COUNT(t.position), p.updated_at
+		FROM playlists p LEFT JOIN playlist_tracks t ON t.playlist_id = p.id
+		GROUP BY p.id ORDER BY p.name`)
+	s.stmtDelPlaylist = p("DELETE FROM playlists WHERE source_path = ?")
 	s.stmtSavePlay = p(`INSERT INTO playback_state(id, source_type, source_path, current_index, position_ms, state, volume, muted, shuffle, loop, updated_at)
 		VALUES(1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET source_type = excluded.source_type, source_path = excluded.source_path,
@@ -408,6 +423,39 @@ func (s *Store) ListAliases() ([]Alias, error) {
 		out = append(out, a)
 	}
 	return out, classify(rows.Err(), "list aliases")
+}
+
+// ListPlaylists returns saved playlists sorted by name with track counts.
+func (s *Store) ListPlaylists() ([]PlaylistInfo, error) {
+	rows, err := s.stmtListPlaylists.Query()
+	if err != nil {
+		return nil, classify(err, "list playlists")
+	}
+	defer rows.Close()
+	out := []PlaylistInfo{}
+	for rows.Next() {
+		var p PlaylistInfo
+		var updated string
+		if err := rows.Scan(&p.Name, &p.SourcePath, &p.TrackCount, &updated); err != nil {
+			return nil, classify(err, "list playlists")
+		}
+		p.UpdatedAt, _ = time.Parse(timeFmt, updated)
+		out = append(out, p)
+	}
+	return out, classify(rows.Err(), "list playlists")
+}
+
+// DeletePlaylist removes a saved playlist by source path.
+func (s *Store) DeletePlaylist(sourcePath string) error {
+	s.writes.Add(1)
+	res, err := s.stmtDelPlaylist.Exec(sourcePath)
+	if err != nil {
+		return classify(err, "remove playlist")
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return apperr.New(apperr.FileNotFound, "playlist %s is not saved", sourcePath)
+	}
+	return nil
 }
 
 // RemoveAlias deletes an alias or returns ALIAS_NOT_FOUND.

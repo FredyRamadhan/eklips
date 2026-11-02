@@ -223,6 +223,99 @@ func TestSSESnapshotIncrementalHeartbeatAndReconnect(t *testing.T) {
 	}
 }
 
+func TestHTTPSeekQueueBrowserAndLevels(t *testing.T) {
+	_, cl, dir := setupTestServer(t, "")
+	ctx := context.Background()
+	for i, name := range []string{"01_a.wav", "02_b.wav", "03_c.wav"} {
+		if err := audio.WriteSineWAV(filepath.Join(dir, name), 44100, 44100*2, 220+float64(i)*110); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := cl.Play(ctx, dir, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cl.Pause(ctx); err != nil {
+		t.Fatal(err)
+	}
+	st, err := cl.SeekTo(ctx, 1500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.PositionMs < 1400 || st.PositionMs > 1600 {
+		t.Fatalf("SeekTo: position=%d", st.PositionMs)
+	}
+	st, err = cl.SeekBy(ctx, -1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.PositionMs < 400 || st.PositionMs > 600 {
+		t.Fatalf("Seek: position=%d", st.PositionMs)
+	}
+
+	// Queue index selection and reordering.
+	st, err = cl.PlayIndex(ctx, 2)
+	if err != nil || st.TrackIndex != 2 {
+		t.Fatalf("PlayIndex: st=%+v err=%v", st, err)
+	}
+	st, err = cl.QueueMove(ctx, 2, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.TrackIndex != 0 {
+		t.Fatalf("QueueMove index=%d", st.TrackIndex)
+	}
+	q, err := cl.Queue(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(q.Tracks) != 3 || !q.Tracks[0].Current {
+		t.Fatalf("unexpected queue after move: %+v", q)
+	}
+	if _, err := cl.QueueRemove(ctx, 2); err != nil {
+		t.Fatal(err)
+	}
+	if q, _ := cl.Queue(ctx); len(q.Tracks) != 2 {
+		t.Fatalf("after remove: %d tracks", len(q.Tracks))
+	}
+	if _, err := cl.QueueAppend(ctx, []string{filepath.Join(dir, "01_a.wav")}); err != nil {
+		t.Fatal(err)
+	}
+	if q, _ := cl.Queue(ctx); len(q.Tracks) != 3 {
+		t.Fatalf("after append: %d tracks", len(q.Tracks))
+	}
+
+	// File browser listing.
+	res, err := cl.Browse(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Path != dir || len(res.Entries) < 3 {
+		t.Fatalf("browse: %+v", res)
+	}
+	// Levels endpoint always answers.
+	if _, err := cl.Levels(ctx); err != nil {
+		t.Fatalf("Levels: %v", err)
+	}
+	// The directory played above is persisted as a saved playlist.
+	list, err := cl.PlaylistList(ctx)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("PlaylistList: list=%v err=%v", list, err)
+	}
+	view, err := cl.PlaylistInspect(ctx, list[0].SourcePath)
+	if err != nil || len(view.Tracks) != 3 {
+		t.Fatalf("PlaylistInspect: view=%+v err=%v", view, err)
+	}
+	if err := cl.PlaylistRemove(ctx, list[0].SourcePath); err != nil {
+		t.Fatalf("PlaylistRemove: %v", err)
+	}
+	if list, _ := cl.PlaylistList(ctx); len(list) != 0 {
+		t.Fatalf("playlist not removed: %v", list)
+	}
+	if st, err := cl.QueueClear(ctx); err != nil || len(st.CurrentTrack) != 0 {
+		t.Fatalf("QueueClear: st=%+v err=%v", st, err)
+	}
+}
+
 func TestHTTPStream10ConcurrentListenersAt1x(t *testing.T) {
 	_, cl, dir := setupTestServer(t, "")
 	wav := filepath.Join(dir, "stream.wav")

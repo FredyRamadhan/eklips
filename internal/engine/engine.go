@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,14 +44,56 @@ type Status struct {
 	Sink         sink.Kind       `json:"sink"`
 	Listeners    int             `json:"listeners"`
 	LastError    string          `json:"last_error,omitempty"`
+	Metadata     audio.Metadata  `json:"metadata,omitempty"`
 }
 
 // QueueItem represents one track in the loaded queue.
 type QueueItem struct {
-	Index   int    `json:"index"`
-	Path    string `json:"path"`
-	Name    string `json:"name"`
-	Current bool   `json:"current"`
+	Index    int            `json:"index"`
+	Path     string         `json:"path"`
+	Name     string         `json:"name"`
+	Current  bool           `json:"current"`
+	Metadata audio.Metadata `json:"metadata,omitempty"`
+}
+
+// Levels is a real-time stereo peak-meter snapshot in dBFS (-60..0).
+type Levels struct {
+	Left  float64 `json:"left"`
+	Right float64 `json:"right"`
+	PeakL float64 `json:"peak_left"`
+	PeakR float64 `json:"peak_right"`
+}
+
+// BrowseEntry is one directory or audio file returned by Browse.
+type BrowseEntry struct {
+	Name     string         `json:"name"`
+	Path     string         `json:"path"`
+	IsDir    bool           `json:"is_dir"`
+	Audio    bool           `json:"audio"`
+	Size     int64          `json:"size,omitempty"`
+	Metadata audio.Metadata `json:"metadata,omitempty"`
+}
+
+// BrowseResult is a directory listing for the TUI file browser.
+type BrowseResult struct {
+	Path    string        `json:"path"`
+	Parent  string        `json:"parent,omitempty"`
+	Root    string        `json:"root,omitempty"`
+	Entries []BrowseEntry `json:"entries"`
+}
+
+// PlaylistInfo describes a saved playlist.
+type PlaylistInfo struct {
+	Name       string    `json:"name"`
+	SourcePath string    `json:"source_path"`
+	TrackCount int       `json:"track_count"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// PlaylistView is an inspectable playlist with its tracks.
+type PlaylistView struct {
+	PlaylistInfo
+	Tracks []QueueItem `json:"tracks"`
 }
 
 // Queue is the public queue snapshot returned by GET /api/v1/queue.
@@ -78,10 +121,22 @@ type Player interface {
 	ToggleMute() (Status, error)
 	ToggleShuffle() (Status, error)
 	ToggleLoop() (Status, error)
+	SeekTo(posMs int64) (Status, error)
+	SeekBy(deltaMs int64) (Status, error)
+	PlayIndex(index int) (Status, error)
+	QueueRemove(index int) (Status, error)
+	QueueMove(fromIndex, toIndex int) (Status, error)
+	QueueClear() (Status, error)
+	QueueAppend(paths []string) (Status, error)
 	Status() Status
 	Queue() Queue
+	Levels() Levels
+	Browse(path string) (BrowseResult, error)
 	PlaylistCreate(dir, output string, force bool) (string, error)
 	PlaylistPlay(target string, loop bool) (Status, error)
+	PlaylistList() ([]PlaylistInfo, error)
+	PlaylistInspect(target string) (PlaylistView, error)
+	PlaylistRemove(target string) error
 	AliasSet(name, playlistPath string) (store.Alias, error)
 	AliasList() ([]store.Alias, error)
 	AliasRemove(name string) error
@@ -166,6 +221,15 @@ type Engine struct {
 	durFrames  atomic.Int64
 	statusSnap atomic.Pointer[Status]
 	queueSnap  atomic.Pointer[Queue]
+
+	// Stereo peak metering (updated from the audio loop, read lock-free).
+	levelL    atomic.Uint32 // linear peak * 10000
+	levelR    atomic.Uint32
+	levelTime atomic.Int64 // unix nanos of the last update
+
+	// Tag cache shared by queue snapshots and the file browser.
+	metaMu    sync.RWMutex
+	metaCache map[string]audio.Metadata
 
 	cmdCh       chan cmdReq
 	persistImm  chan store.Playback
@@ -252,6 +316,7 @@ func New(opts Options) (*Engine, error) {
 		bcast:           sink.NewBroadcaster(f, chunkBytes, 2*time.Second, opts.MaxListeners),
 		bus:             events.NewBus(256, 64),
 		machine:         core.NewMachine(opts.Seed),
+		metaCache:       make(map[string]audio.Metadata),
 		prefetchCh:      make(chan prefetchResult, 4),
 		fbuf:            make([]float32, chunkFrames*audio.Channels),
 		pcm:             make([]byte, chunkBytes),
@@ -463,8 +528,10 @@ func (e *Engine) schedulePersist(immediate bool) {
 func (e *Engine) updateSnapshots() {
 	ms := e.machine.Snapshot()
 	curTrack := ""
+	var curMeta audio.Metadata
 	if ms.TrackIndex >= 0 && ms.TrackIndex < len(ms.Source.Tracks) {
 		curTrack = ms.Source.Tracks[ms.TrackIndex]
+		curMeta = e.metadataFor(curTrack)
 	}
 	st := &Status{
 		State:        ms.State,
@@ -482,16 +549,29 @@ func (e *Engine) updateSnapshots() {
 		Sink:         e.sinkKind,
 		Listeners:    e.bcast.Count(),
 		LastError:    e.lastErr,
+		Metadata:     curMeta,
 	}
 	e.statusSnap.Store(st)
 
+	// Tags are read lazily for the current track and for reasonably sized
+	// queues. Huge queues use filename heuristics so a queue load never stalls
+	// the audio actor on thousands of file reads.
+	const tagQueueLimit = 500
+	useTags := len(ms.Source.Tracks) <= tagQueueLimit
 	items := make([]QueueItem, len(ms.Source.Tracks))
 	for i, p := range ms.Source.Tracks {
+		md := audio.Metadata{}
+		if useTags || i == ms.TrackIndex {
+			md = e.metadataFor(p)
+		} else {
+			md = audio.FilenameMetadata(p)
+		}
 		items[i] = QueueItem{
-			Index:   i,
-			Path:    p,
-			Name:    filepath.Base(p),
-			Current: i == ms.TrackIndex,
+			Index:    i,
+			Path:     p,
+			Name:     filepath.Base(p),
+			Current:  i == ms.TrackIndex,
+			Metadata: md,
 		}
 	}
 	orderCopy := make([]int, len(ms.Order))
@@ -522,6 +602,77 @@ func (e *Engine) Status() Status {
 // Queue returns a lock-free snapshot of the current queue.
 func (e *Engine) Queue() Queue {
 	return *e.queueSnap.Load()
+}
+
+func (e *Engine) metadataFor(path string) audio.Metadata {
+	if path == "" {
+		return audio.Metadata{}
+	}
+	e.metaMu.RLock()
+	md, ok := e.metaCache[path]
+	e.metaMu.RUnlock()
+	if ok {
+		return md
+	}
+	md = audio.ReadMetadata(path)
+	e.metaMu.Lock()
+	if len(e.metaCache) > 50000 {
+		clear(e.metaCache)
+	}
+	e.metaCache[path] = md
+	e.metaMu.Unlock()
+	return md
+}
+
+// Levels returns the current stereo peak meter with an exponential decay so
+// the visualizer falls smoothly to silence after playback stops.
+func (e *Engine) Levels() Levels {
+	l := float64(e.levelL.Load()) / 10000
+	r := float64(e.levelR.Load()) / 10000
+	last := e.levelTime.Load()
+	if last > 0 {
+		elapsed := time.Since(time.Unix(0, last))
+		if elapsed > 30*time.Millisecond {
+			decay := math.Pow(0.72, elapsed.Seconds()*10)
+			l *= decay
+			r *= decay
+			if l < 0.0005 {
+				l = 0
+			}
+			if r < 0.0005 {
+				r = 0
+			}
+		}
+	}
+	return Levels{Left: toDB(l), Right: toDB(r), PeakL: l, PeakR: r}
+}
+
+func toDB(peak float64) float64 {
+	if peak <= 0.00001 {
+		return -60
+	}
+	db := 20 * math.Log10(peak)
+	if db < -60 {
+		return -60
+	}
+	if db > 0 {
+		return 0
+	}
+	return db
+}
+
+func abs32(v float32) float32 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func min32(v, max float32) float32 {
+	if v > max {
+		return max
+	}
+	return v
 }
 
 // Events returns the SSE event bus.
@@ -722,11 +873,22 @@ func (e *Engine) stepAudio() {
 		gain = 0
 	}
 	samples := filled * 2
+	var peakL, peakR float32
 	for i := 0; i < samples; i++ {
 		v := softLimit(e.fbuf[i] * gain)
+		if i&1 == 0 {
+			if a := abs32(v); a > peakL {
+				peakL = a
+			}
+		} else if a := abs32(v); a > peakR {
+			peakR = a
+		}
 		s := int16(math.Round(float64(v * 32767.0)))
 		binary.LittleEndian.PutUint16(e.pcm[i*2:], uint16(s))
 	}
+	e.levelL.Store(uint32(min32(peakL, 1) * 10000))
+	e.levelR.Store(uint32(min32(peakR, 1) * 10000))
+	e.levelTime.Store(time.Now().UnixNano())
 
 	outBytes := e.pcm[:filled*4]
 	if e.sinkKind.HasHTTP() || e.bcast.Count() > 0 {
@@ -1198,6 +1360,474 @@ func (e *Engine) ToggleLoop() (Status, error) {
 		e.schedulePersist(true)
 		return st, nil
 	})
+}
+
+// SeekTo jumps to an absolute position in the current track.
+func (e *Engine) SeekTo(posMs int64) (Status, error) {
+	return e.do(func() (Status, error) { return e.seekLocked(posMs) })
+}
+
+// SeekBy jumps by a relative number of milliseconds (±5s, ±30s, ...).
+func (e *Engine) SeekBy(deltaMs int64) (Status, error) {
+	return e.do(func() (Status, error) {
+		cur := e.posFrames.Load() * 1000 / int64(e.sampleRate)
+		return e.seekLocked(cur + deltaMs)
+	})
+}
+
+func (e *Engine) seekLocked(posMs int64) (Status, error) {
+	if e.cur == nil || e.machine.State() == core.Stopped {
+		return e.Status(), apperr.New(apperr.InvalidState, "no active track to seek")
+	}
+	if posMs < 0 {
+		posMs = 0
+	}
+	target := posMs * int64(e.sampleRate) / 1000
+	dur := e.durFrames.Load()
+	if dur > 0 && target >= dur {
+		// Seeking past the end behaves like a natural track transition.
+		if !e.spliceToNext() {
+			e.updateSnapshots()
+			st := e.Status()
+			e.bus.Publish(events.State, st)
+			e.schedulePersist(true)
+			return st, nil
+		}
+		e.updateSnapshots()
+		st := e.Status()
+		e.bus.Publish(events.State, st)
+		e.schedulePersist(true)
+		return st, nil
+	}
+
+	curFrames := e.posFrames.Load()
+	if target >= curFrames {
+		if err := e.cur.Skip(target - curFrames); err != nil {
+			e.emitError(err)
+			return e.Status(), err
+		}
+		e.posFrames.Store(target)
+	} else {
+		path := e.machine.CurrentTrack()
+		tr, err := audio.Open(path, e.sampleRate)
+		if err != nil {
+			e.emitError(err)
+			return e.Status(), err
+		}
+		if err := tr.Skip(target); err != nil {
+			_ = tr.Close()
+			e.emitError(err)
+			return e.Status(), err
+		}
+		_ = e.cur.Close()
+		e.cur = tr
+		e.durFrames.Store(max(0, tr.TotalFrames()))
+		e.out.Flush()
+		e.posFrames.Store(target)
+		if e.machine.State() == core.Playing {
+			e.primeDevice()
+			e.out.Resume()
+		} else {
+			e.out.Pause()
+		}
+	}
+	e.pacer.Reset()
+	e.updateSnapshots()
+	st := e.Status()
+	e.bus.Publish(events.State, st)
+	e.schedulePersist(true)
+	return st, nil
+}
+
+// PlayIndex jumps directly to the queue track at index and starts it.
+func (e *Engine) PlayIndex(index int) (Status, error) {
+	return e.do(func() (Status, error) {
+		wasPaused := e.machine.State() == core.Paused
+		eff, err := e.machine.SelectIndex(index)
+		if err != nil {
+			return e.Status(), err
+		}
+		if eff == core.EffectStart {
+			if err := e.startCurrentTrack(); err != nil {
+				e.emitError(err)
+				return e.Status(), err
+			}
+			if wasPaused {
+				e.out.Pause()
+			}
+		}
+		e.updateSnapshots()
+		st := e.Status()
+		e.bus.Publish(events.Track, st)
+		e.bus.Publish(events.State, st)
+		e.schedulePersist(true)
+		return st, nil
+	})
+}
+
+// QueueRemove removes a track from the loaded queue.
+func (e *Engine) QueueRemove(index int) (Status, error) {
+	return e.do(func() (Status, error) {
+		wasPaused := e.machine.State() == core.Paused
+		eff, err := e.machine.RemoveTrack(index)
+		if err != nil {
+			return e.Status(), err
+		}
+		e.invalidatePrefetch()
+		switch eff {
+		case core.EffectStart:
+			if err := e.startCurrentTrack(); err != nil {
+				e.emitError(err)
+				return e.Status(), err
+			}
+			if wasPaused {
+				e.out.Pause()
+			}
+		case core.EffectStop:
+			e.closePipeline()
+			e.out.Flush()
+			e.out.Pause()
+			e.posFrames.Store(0)
+			e.durFrames.Store(0)
+		}
+		e.updateSnapshots()
+		st := e.Status()
+		e.bus.Publish(events.Queue, e.Queue())
+		e.bus.Publish(events.Track, st)
+		e.bus.Publish(events.State, st)
+		e.schedulePersist(true)
+		return st, nil
+	})
+}
+
+// QueueMove reorders a track within the loaded queue.
+func (e *Engine) QueueMove(fromIndex, toIndex int) (Status, error) {
+	return e.do(func() (Status, error) {
+		if _, err := e.machine.MoveTrack(fromIndex, toIndex); err != nil {
+			return e.Status(), err
+		}
+		e.invalidatePrefetch()
+		e.updateSnapshots()
+		st := e.Status()
+		e.bus.Publish(events.Queue, e.Queue())
+		e.bus.Publish(events.Track, st)
+		e.schedulePersist(true)
+		return st, nil
+	})
+}
+
+// QueueClear empties the queue and stops playback.
+func (e *Engine) QueueClear() (Status, error) {
+	return e.do(func() (Status, error) {
+		eff := e.machine.Clear()
+		if eff == core.EffectStop {
+			e.closePipeline()
+			e.out.Flush()
+			e.out.Pause()
+		}
+		e.posFrames.Store(0)
+		e.durFrames.Store(0)
+		e.updateSnapshots()
+		st := e.Status()
+		e.bus.Publish(events.Queue, e.Queue())
+		e.bus.Publish(events.State, st)
+		e.schedulePersist(true)
+		return st, nil
+	})
+}
+
+// QueueAppend appends files or directories to the loaded queue. Directories
+// are expanded to their supported audio files. When nothing is loaded, the
+// appended queue starts playing.
+func (e *Engine) QueueAppend(paths []string) (Status, error) {
+	var expanded []string
+	for _, p := range paths {
+		abs, err := config.NormalizePath(p, e.opts.MediaRoot)
+		if err != nil {
+			return e.Status(), err
+		}
+		info, err := os.Stat(abs)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return e.Status(), apperr.New(apperr.FileNotFound, "%s does not exist", abs)
+			}
+			return e.Status(), apperr.Wrap(apperr.FileNotFound, err, "stat %s", abs)
+		}
+		if info.IsDir() {
+			files, err := media.Scan(abs, e.opts.MaxQueue)
+			if err != nil {
+				return e.Status(), err
+			}
+			expanded = append(expanded, files...)
+			continue
+		}
+		if err := media.CheckAudioFile(abs); err != nil {
+			return e.Status(), err
+		}
+		expanded = append(expanded, abs)
+	}
+	if len(expanded) == 0 {
+		return e.Status(), apperr.New(apperr.FileNotFound, "no audio files to append")
+	}
+	snap := e.Queue()
+	curCount := len(snap.Tracks)
+	if e.opts.MaxQueue > 0 && curCount+len(expanded) > e.opts.MaxQueue {
+		return e.Status(), apperr.New(apperr.InvalidCommand,
+			"queue would exceed the maximum of %d tracks", e.opts.MaxQueue)
+	}
+
+	// Opening the first appended track before mutating state gives a clean
+	// error when a file is corrupt and nothing was loaded yet.
+	var first *audio.Track
+	firstIdx := -1
+	if curCount == 0 {
+		for i, p := range expanded {
+			tr, err := audio.Open(p, e.sampleRate)
+			if err == nil {
+				err = tr.Prebuffer(e.chunkFrames * 8)
+				if err != nil {
+					_ = tr.Close()
+					tr = nil
+				}
+			}
+			if err == nil {
+				first = tr
+				firstIdx = i
+				break
+			}
+		}
+		if first == nil {
+			return e.Status(), apperr.New(apperr.DecodeError, "no playable tracks to append")
+		}
+	}
+
+	return e.do(func() (Status, error) {
+		eff, err := e.machine.AppendTracks(expanded)
+		if err != nil {
+			if first != nil {
+				_ = first.Close()
+			}
+			return e.Status(), err
+		}
+		if eff == core.EffectStart {
+			for i := 0; i < firstIdx; i++ {
+				e.machine.Advance()
+			}
+			e.closePipeline()
+			e.cur = first
+			e.posFrames.Store(0)
+			e.durFrames.Store(max(0, first.TotalFrames()))
+			e.lastErr = ""
+			e.out.Flush()
+			e.primeDevice()
+			e.out.Resume()
+		} else if first != nil {
+			_ = first.Close()
+		}
+		e.invalidatePrefetch()
+		e.updateSnapshots()
+		st := e.Status()
+		e.bus.Publish(events.Queue, e.Queue())
+		e.bus.Publish(events.Track, st)
+		e.bus.Publish(events.State, st)
+		e.schedulePersist(true)
+		return st, nil
+	})
+}
+
+// Browse lists a directory for the TUI file browser. An empty path starts at
+// the configured media root (or the daemon's working directory).
+func (e *Engine) Browse(path string) (BrowseResult, error) {
+	base := strings.TrimSpace(path)
+	if base == "" {
+		base = e.opts.MediaRoot
+		if base == "" {
+			wd, err := os.Getwd()
+			if err != nil {
+				return BrowseResult{}, apperr.Wrap(apperr.Internal, err, "resolve working directory")
+			}
+			base = wd
+		}
+	}
+	abs, err := config.NormalizePath(base, e.opts.MediaRoot)
+	if err != nil {
+		return BrowseResult{}, err
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return BrowseResult{}, apperr.New(apperr.FileNotFound, "%s does not exist", abs)
+		}
+		return BrowseResult{}, apperr.Wrap(apperr.FileNotFound, err, "stat %s", abs)
+	}
+	if !info.IsDir() {
+		return BrowseResult{}, apperr.New(apperr.InvalidCommand, "%s is not a directory", abs)
+	}
+	entries, err := os.ReadDir(abs)
+	if err != nil {
+		return BrowseResult{}, apperr.Wrap(apperr.FileNotFound, err, "read %s", abs)
+	}
+
+	root := ""
+	if e.opts.MediaRoot != "" {
+		if r, err := config.NormalizePath(e.opts.MediaRoot, ""); err == nil {
+			root = r
+		}
+	}
+	result := BrowseResult{Path: abs, Root: root, Entries: make([]BrowseEntry, 0, len(entries))}
+	parent := filepath.Dir(abs)
+	if root != "" && (abs == root || !strings.HasPrefix(parent+string(filepath.Separator), root+string(filepath.Separator))) {
+		parent = ""
+	} else if abs == string(filepath.Separator) {
+		parent = ""
+	}
+	result.Parent = parent
+
+	for _, ent := range entries {
+		name := ent.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		full := filepath.Join(abs, name)
+		if ent.IsDir() {
+			result.Entries = append(result.Entries, BrowseEntry{Name: name, Path: full, IsDir: true})
+			continue
+		}
+		if ent.Type()&os.ModeSymlink != 0 {
+			// Resolve symlinks through the same media-root validation used by
+			// playback so the browser cannot list files outside the root.
+			resolved, err := config.NormalizePath(full, e.opts.MediaRoot)
+			if err != nil {
+				continue
+			}
+			st, err := os.Stat(resolved)
+			if err != nil {
+				continue
+			}
+			if st.IsDir() {
+				result.Entries = append(result.Entries, BrowseEntry{Name: name, Path: resolved, IsDir: true})
+				continue
+			}
+			if !media.IsAudio(name) {
+				continue
+			}
+			result.Entries = append(result.Entries, BrowseEntry{
+				Name:     name,
+				Path:     resolved,
+				Audio:    true,
+				Size:     st.Size(),
+				Metadata: e.metadataFor(resolved),
+			})
+			continue
+		}
+		if !media.IsAudio(name) {
+			continue
+		}
+		st, err := ent.Info()
+		var size int64
+		if err == nil {
+			size = st.Size()
+		}
+		result.Entries = append(result.Entries, BrowseEntry{
+			Name:     name,
+			Path:     full,
+			Audio:    true,
+			Size:     size,
+			Metadata: e.metadataFor(full),
+		})
+	}
+	sort.SliceStable(result.Entries, func(i, j int) bool {
+		a, b := result.Entries[i], result.Entries[j]
+		if a.IsDir != b.IsDir {
+			return a.IsDir
+		}
+		return media.NaturalLess(a.Name, b.Name)
+	})
+	return result, nil
+}
+
+// PlaylistList lists saved playlists from the database.
+func (e *Engine) PlaylistList() ([]PlaylistInfo, error) {
+	if e.store == nil {
+		return []PlaylistInfo{}, nil
+	}
+	list, err := e.store.ListPlaylists()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PlaylistInfo, 0, len(list))
+	for _, p := range list {
+		out = append(out, PlaylistInfo{
+			Name:       p.Name,
+			SourcePath: p.SourcePath,
+			TrackCount: p.TrackCount,
+			UpdatedAt:  p.UpdatedAt,
+		})
+	}
+	return out, nil
+}
+
+// PlaylistInspect returns a stored playlist and its tracks.
+func (e *Engine) PlaylistInspect(target string) (PlaylistView, error) {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return PlaylistView{}, apperr.New(apperr.InvalidCommand, "missing playlist path or alias")
+	}
+	if e.store == nil {
+		return PlaylistView{}, apperr.New(apperr.DBError, "database is not configured")
+	}
+	isAlias := store.ValidAliasName(target) &&
+		!strings.ContainsRune(target, '/') &&
+		!strings.ContainsRune(target, filepath.Separator) &&
+		!strings.HasSuffix(strings.ToLower(target), ".json")
+	if isAlias {
+		a, err := e.store.GetAlias(target)
+		if err != nil {
+			return PlaylistView{}, err
+		}
+		target = a.PlaylistPath
+	}
+	if e.opts.MediaRoot != "" {
+		norm, err := config.NormalizePath(target, e.opts.MediaRoot)
+		if err != nil {
+			return PlaylistView{}, err
+		}
+		target = norm
+	}
+	name, tracks, err := e.store.PlaylistTracks(target)
+	if err != nil {
+		return PlaylistView{}, err
+	}
+	if len(tracks) == 0 {
+		if pl, lerr := playlist.Load(target, e.opts.MaxQueue); lerr == nil {
+			name, tracks = pl.Name, pl.Tracks
+		} else {
+			return PlaylistView{}, apperr.New(apperr.FileNotFound, "playlist %s is not saved", target)
+		}
+	}
+	view := PlaylistView{PlaylistInfo: PlaylistInfo{Name: name, SourcePath: target, TrackCount: len(tracks)}}
+	view.Tracks = make([]QueueItem, len(tracks))
+	for i, p := range tracks {
+		view.Tracks[i] = QueueItem{Index: i, Path: p, Name: filepath.Base(p), Metadata: e.metadataFor(p)}
+	}
+	return view, nil
+}
+
+// PlaylistRemove deletes a saved playlist by source path or alias.
+func (e *Engine) PlaylistRemove(target string) error {
+	if e.store == nil {
+		return apperr.New(apperr.DBError, "database is not configured")
+	}
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return apperr.New(apperr.InvalidCommand, "missing playlist path or alias")
+	}
+	if store.ValidAliasName(target) && !strings.ContainsRune(target, '/') {
+		if _, err := e.store.GetAlias(target); err == nil {
+			return e.store.RemoveAlias(target)
+		}
+	}
+	return e.store.DeletePlaylist(target)
 }
 
 // PlaylistCreate writes either a template playlist.json (when dir is empty) or

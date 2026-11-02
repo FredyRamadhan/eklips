@@ -46,6 +46,7 @@ type Config struct {
 	Remote     string
 	NoStart    bool
 	StopOnExit bool
+	Theme      string
 }
 
 // Default returns a Config populated with safe defaults and environment
@@ -61,6 +62,7 @@ func Default() Config {
 		SampleRate:   DefaultSampleRate,
 		MaxListeners: DefaultMaxListeners,
 		MaxQueue:     DefaultMaxQueue,
+		Theme:        "default",
 	}
 	if v := os.Getenv("EKLIPS_DB"); v != "" {
 		c.DBPath = v

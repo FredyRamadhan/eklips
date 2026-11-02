@@ -207,6 +207,95 @@ func (c *Client) Loop(ctx context.Context) (engine.Status, error) {
 	return st, err
 }
 
+// SeekTo calls POST /api/v1/seek with an absolute position.
+func (c *Client) SeekTo(ctx context.Context, posMs int64) (engine.Status, error) {
+	var st engine.Status
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/seek", server.SeekRequest{PositionMs: &posMs}, &st)
+	return st, err
+}
+
+// SeekBy calls POST /api/v1/seek with a relative delta.
+func (c *Client) SeekBy(ctx context.Context, deltaMs int64) (engine.Status, error) {
+	var st engine.Status
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/seek", server.SeekRequest{DeltaMs: &deltaMs}, &st)
+	return st, err
+}
+
+// PlayIndex calls POST /api/v1/queue/play.
+func (c *Client) PlayIndex(ctx context.Context, index int) (engine.Status, error) {
+	var st engine.Status
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/queue/play", server.IndexRequest{Index: index}, &st)
+	return st, err
+}
+
+// QueueRemove calls POST /api/v1/queue/remove.
+func (c *Client) QueueRemove(ctx context.Context, index int) (engine.Status, error) {
+	var st engine.Status
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/queue/remove", server.IndexRequest{Index: index}, &st)
+	return st, err
+}
+
+// QueueMove calls POST /api/v1/queue/move.
+func (c *Client) QueueMove(ctx context.Context, from, to int) (engine.Status, error) {
+	var st engine.Status
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/queue/move", server.MoveRequest{From: from, To: to}, &st)
+	return st, err
+}
+
+// QueueClear calls POST /api/v1/queue/clear.
+func (c *Client) QueueClear(ctx context.Context) (engine.Status, error) {
+	var st engine.Status
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/queue/clear", nil, &st)
+	return st, err
+}
+
+// QueueAppend calls POST /api/v1/queue/append.
+func (c *Client) QueueAppend(ctx context.Context, paths []string) (engine.Status, error) {
+	var st engine.Status
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/queue/append", server.QueueAppendRequest{Paths: paths}, &st)
+	return st, err
+}
+
+// Levels calls GET /api/v1/levels.
+func (c *Client) Levels(ctx context.Context) (engine.Levels, error) {
+	var lv engine.Levels
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/levels", nil, &lv)
+	return lv, err
+}
+
+// Browse calls GET /api/v1/browse.
+func (c *Client) Browse(ctx context.Context, path string) (engine.BrowseResult, error) {
+	var res engine.BrowseResult
+	q := ""
+	if path != "" {
+		q = "?path=" + url.QueryEscape(path)
+	}
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/browse"+q, nil, &res)
+	return res, err
+}
+
+// PlaylistList calls GET /api/v1/playlists.
+func (c *Client) PlaylistList(ctx context.Context) ([]engine.PlaylistInfo, error) {
+	var resp struct {
+		Playlists []engine.PlaylistInfo `json:"playlists"`
+	}
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/playlists", nil, &resp)
+	return resp.Playlists, err
+}
+
+// PlaylistInspect calls GET /api/v1/playlists/tracks.
+func (c *Client) PlaylistInspect(ctx context.Context, target string) (engine.PlaylistView, error) {
+	var view engine.PlaylistView
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/playlists/tracks?target="+url.QueryEscape(target), nil, &view)
+	return view, err
+}
+
+// PlaylistRemove calls DELETE /api/v1/playlists.
+func (c *Client) PlaylistRemove(ctx context.Context, target string) error {
+	var out map[string]string
+	return c.doJSON(ctx, http.MethodDelete, "/api/v1/playlists?target="+url.QueryEscape(target), nil, &out)
+}
+
 // Shutdown calls POST /api/v1/shutdown.
 func (c *Client) Shutdown(ctx context.Context) error {
 	var out map[string]string

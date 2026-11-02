@@ -22,6 +22,9 @@ ambiguous, the resolution chosen here is recorded under
 | cgo | Only the device sink needs cgo (ALSA on Linux). It is isolated behind the `cgo` build tag; `CGO_ENABLED=0` builds return `SINK_UNAVAILABLE` for `device`/`both`. |
 | Security | Loopback bind; bearer token mandatory on non-loopback binds unless `--allow-remote`; paths normalised and optionally restricted with `--media-root`; no shell interpolation (direct `exec`); 64 KiB request body limit; header/read timeouts; non-root container; token never logged or persisted. |
 | Playlist schema | Versioned JSON: `{ "version": 1, "name": "...", "tracks": [{ "path": "..." }] }`. Relative paths resolve against the playlist file's directory. |
+| Terminal player (Phase 12) | The HTTP API remains the internal transport and stays backward compatible. Seeking, queue mutation, browse, playlist inspection, and metering are exposed as additive `/api/v1` endpoints so the TUI can run locally or remotely. The TUI owns no audio state. |
+| Metadata | Native tag readers in `internal/audio/tags.go`: ID3v2.2/2.3/2.4 for MP3, Vorbis Comments for FLAC/OGG, RIFF `INFO`/ID3 chunks for WAV. Filename heuristics (`Artist - Title`, `01. Title`) are the fallback. Tags are cached per path; queues over 500 tracks use filename metadata except for the current track so a load never stalls the audio actor. |
+| Themes | Five built-in palettes (`default`, `nord`, `gruvbox`, `tokyonight`, `catppuccin`) compiled into the TUI. Selection is `--theme` or `:theme <name>`; unknown names are rejected without changing the active palette. |
 
 ## 2. Package layout
 
@@ -32,7 +35,7 @@ internal/config       daemon/client options, defaults, path resolution
 internal/media        supported extensions, folder scan with natural sort
 internal/playlist     JSON parse/validate/generate
 internal/core         pure state machine (no I/O)
-internal/audio        decoders, resampler, gapless trimming, PCM helpers
+internal/audio        decoders, resampler, gapless trimming, tag readers, PCM helpers
 internal/sink         Sink interface; null, device (cgo), HTTP broadcaster
 internal/engine       playback actor: core + audio + sinks + events + persistence
 internal/events       event bus with replay ring
@@ -74,6 +77,8 @@ Precondition checks run in this order: `NO_MEDIA_LOADED` → `PLAYLIST_REQUIRED`
 Queue semantics:
 
 - The queue is the list of tracks plus a play *order* (identity, or a permutation when shuffled) and a cursor into that order.
+- `select(index)` jumps to a track (starting playback if stopped) without rebuilding the source. `remove(index)` drops a track: removing a non-current track preserves the active decoder; removing the current track starts the next one or clears an empty queue. `move(from,to)` reorders tracks while preserving the current track identity. `clear()` empties the queue and stops. `append(paths)` expands directories, converts a single-file source into a playlist, and starts playback if nothing was loaded.
+- Every queue mutation bumps the generation counter, invalidating any in-flight prefetch.
 - Enabling shuffle builds a permutation whose first element is the current track, so the current track is not restarted. Disabling shuffle restores identity order with the cursor on the current track.
 - `next` at the last track: wraps if loop is on, otherwise `INVALID_STATE` ("end of playlist").
 - `previous` at the first track: wraps if loop is on, otherwise restarts the first track.
@@ -104,6 +109,22 @@ flowchart LR
 - **Paused/stopped streams.** While not playing, the loop emits 20 ms silence chunks only if HTTP listeners are connected, so connections stay open; with no listeners the loop blocks on its command channel (zero idle CPU).
 - **Stream format.** `audio/wav` with a streaming RIFF header (sizes set to max), followed by raw PCM. Live streams do not support byte ranges: `Accept-Ranges: none`, Range headers are ignored and a 200 is returned (RFC 9110 permits this).
 
+### Seeking
+
+- `POST /api/v1/seek` accepts either `position_ms` (absolute) or `delta_ms` (relative), matching the TUI's `h`/`l` (∓5 s) and `[`/`]` (∓30 s) keys.
+- **Forward seek:** discard frames with `Track.Skip` in the output sample domain. No decoder reopen, no sink flush.
+- **Backward seek:** reopen the decoder, skip to the target frame, flush the device ring, and re-prime ~160 ms before resuming. The sink and HTTP stream stay open.
+- **Past the end:** behaves like a natural transition — `Advance` selects the next track (or stops, or repeats for a looping single file). Seeking is a no-op error (`INVALID_STATE`) when nothing is playing.
+- Seeking publishes a `state` event containing the updated status/position and persists immediately.
+
+### Stereo metering
+
+The actor loop computes per-chunk post-gain, post-limiter peak amplitudes for left and right and stores them in atomics. `GET /api/v1/levels` converts them to dBFS with an exponential decay (~30 ms / 0.72 factor) so the TUI meter falls smoothly. The TUI polls it at 8 Hz only while playing; it is not part of the SSE stream.
+
+### Metadata
+
+`audio.ReadMetadata` reads only tag headers (never whole files; capped at 4 MiB). Results are cached in the engine. `Status` and every `QueueItem` carry `metadata` (`title`, `artist`, `album`, `year`, `track_number`), and the TUI renders `Artist — Title (Album)`. For queues larger than 500 tracks only the current track and the browser's visible directory are parsed; other rows use filename heuristics.
+
 ## 5. Database schema
 
 ```sql
@@ -128,9 +149,41 @@ event: volume
 data: {"volume":55,"muted":false}
 ```
 
-Event types: `snapshot`, `state`, `track`, `queue`, `volume`, `mute`, `shuffle`, `loop`, `error`, `device`. `snapshot`/`track`/`state` carry the full status object; others carry the changed fields. Heartbeat: `: ping` every 15 s. Subscribers have a 64-event buffer; overflow evicts the subscriber (client reconnects with `Last-Event-ID`).
+Event types: `snapshot`, `state`, `track`, `queue`, `volume`, `mute`, `shuffle`, `loop`, `error`, `device`, `shutdown`. `snapshot`/`track`/`state` carry the full status object; others carry the changed fields. Queue selection/reorder/remove/append emit `queue` (and `track` when the current track changes); seeks emit `state` with the new position. Heartbeat: `: ping` every 15 s. Subscribers have a 64-event buffer; overflow evicts the subscriber (client reconnects with `Last-Event-ID`).
 
-## 7. Performance budgets
+## 7. TUI architecture
+
+The TUI is a pure Bubble Tea client (`internal/tui`) with three views selected by
+`1`/`2`/`3`/`Tab`:
+
+| View | State | Data source |
+| --- | --- | --- |
+| Queue & Now Playing | cursor (distinct from the playing index), scroll offset, filter | `status`/`queue` snapshots + `state`/`track`/`queue` SSE events |
+| File Browser | current directory, entries, cursor, filter | `GET /api/v1/browse?path=` (daemon-side path validation and metadata) |
+| Playlists & Aliases | saved playlist/alias rows, preview | `GET /api/v1/playlists`, `GET /api/v1/playlists/tracks`, `GET /api/v1/aliases` |
+
+- **Rendering.** The header (connection badge + theme), tab bar, view body, banners,
+  and footer are rendered into one cached string. `View()` rebuilds only when a
+  model field changes (`dirty`); the renderer is capped at 30 FPS. Styles are
+  precomputed per theme, so switching themes is an O(1) style swap.
+- **Progress vs. metering.** Progress is interpolated locally at 4 Hz from the
+  last `state`/`track` snapshot. Meter levels are fetched at 8 Hz only while
+  playing. Neither poll runs while stopped or paused.
+- **Queue cursor.** `cursorIndex` is an absolute index into the queue, independent
+  of `status.TrackIndex`. Fuzzy filtering produces a visible-index list; `j`/`k`
+  move within that list and `Enter` sends the absolute index.
+- **Input modes.** `/` opens an inline filter, `:` opens the command bar. Input
+  mode captures all keys except `Esc`/`Enter`; a cancelled filter restores the
+  previous value.
+- **Confirmation.** `Q`, `C`, and playlist deletion open a `y/N` prompt; the
+  default action is cancel.
+- **Terminal safety.** The terminal is restored on normal exit, panic (deferred
+  `ReleaseTerminal`), and context cancellation. Resize is handled by
+  `WindowSizeMsg` without restarting the program.
+- **Auth token.** Held only in the HTTP client; never rendered, logged, or
+  persisted.
+
+## 8. Performance budgets
 
 | Metric | Budget |
 | --- | --- |
@@ -142,11 +195,13 @@ Event types: `snapshot`, `state`, `track`, `queue`, `volume`, `mute`, `shuffle`,
 | Gapless splice | 0 inserted samples; < 1 chunk of extra work |
 | Fan-out publish (10 listeners, 20 ms chunk) | < 20 µs |
 | Status/command HTTP latency (loopback) | < 5 ms p99 excluding decoder open |
-| TUI | 4 Hz tick only while playing; ≤ 30 FPS; View() < 200 µs |
+| TUI | 4 Hz progress + 8 Hz meter only while playing; ≤ 30 FPS; View() < 200 µs |
+| Metadata | header-only reads, cached; ≤ 1 tag read per path; huge queues use filename fallback |
+| Seek (backward) | one decoder reopen + flush + ≤160 ms pre-roll; no sink/stream restart |
 
 Benchmarks in `internal/audio`, `internal/sink`, `internal/engine`, `internal/store`, and `internal/tui` are the acceptance gates; `scripts/bench.sh` compares against `bench/baseline.txt` with `benchstat`.
 
-## 8. Resolved ambiguities
+## 9. Resolved ambiguities
 
 1. **`next`/`previous` when stopped.** The spec lists both `PLAYLIST_REQUIRED` and "requires active playback". Resolution: single-file → `PLAYLIST_REQUIRED`; playlist but stopped → `INVALID_STATE`.
 2. **`status` with nothing loaded.** The state model says status requires a source, but `eklips status` must report daemon status. Resolution: status always succeeds and reports `source_type: ""`.

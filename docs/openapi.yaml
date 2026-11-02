@@ -79,6 +79,21 @@ components:
           type: integer
         last_error:
           type: string
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+    Metadata:
+      type: object
+      properties:
+        title:
+          type: string
+        artist:
+          type: string
+        album:
+          type: string
+        year:
+          type: string
+        track_number:
+          type: integer
     Queue:
       type: object
       properties:
@@ -113,6 +128,8 @@ components:
                 type: string
               current:
                 type: boolean
+              metadata:
+                $ref: '#/components/schemas/Metadata'
     Alias:
       type: object
       properties:
@@ -335,3 +352,146 @@ paths:
       responses:
         "200":
           description: Alias deleted
+  /api/v1/seek:
+    post:
+      summary: Seek within the current track
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                position_ms:
+                  type: integer
+                  format: int64
+                delta_ms:
+                  type: integer
+                  format: int64
+      responses:
+        "200":
+          description: Updated playback status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
+  /api/v1/levels:
+    get:
+      summary: Real-time stereo peak meter (-60..0 dBFS)
+      responses:
+        "200":
+          description: Meter levels
+  /api/v1/browse:
+    get:
+      summary: List a directory for the TUI file browser
+      parameters:
+        - in: query
+          name: path
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Directory entries (folders first, then audio files with metadata)
+  /api/v1/queue/play:
+    post:
+      summary: Jump to and play a queue track by index
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [index]
+              properties:
+                index:
+                  type: integer
+      responses:
+        "200":
+          description: Updated playback status
+  /api/v1/queue/remove:
+    post:
+      summary: Remove a track from the queue
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [index]
+              properties:
+                index:
+                  type: integer
+      responses:
+        "200":
+          description: Updated playback status
+  /api/v1/queue/move:
+    post:
+      summary: Reorder a queue track
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [from, to]
+              properties:
+                from:
+                  type: integer
+                to:
+                  type: integer
+      responses:
+        "200":
+          description: Updated playback status
+  /api/v1/queue/clear:
+    post:
+      summary: Clear the queue and stop playback
+      responses:
+        "200":
+          description: Updated playback status
+  /api/v1/queue/append:
+    post:
+      summary: Append files or directories to the queue
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [paths]
+              properties:
+                paths:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        "200":
+          description: Updated playback status
+  /api/v1/playlists:
+    get:
+      summary: List saved playlists
+      responses:
+        "200":
+          description: Saved playlist summaries
+    delete:
+      summary: Delete a saved playlist by source path or alias
+      parameters:
+        - in: query
+          name: target
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Playlist deleted
+  /api/v1/playlists/tracks:
+    get:
+      summary: Inspect a saved playlist and its tracks
+      parameters:
+        - in: query
+          name: target
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Playlist with tracks and metadata

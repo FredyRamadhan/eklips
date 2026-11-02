@@ -126,6 +126,12 @@ func parseArgs(raw []string) (parsedFlags, error) {
 			p.cfg.NoStart = true
 		case "--stop-on-exit":
 			p.cfg.StopOnExit = true
+		case "--theme":
+			v, err := nextVal()
+			if err != nil {
+				return p, err
+			}
+			p.cfg.Theme = v
 		case "--loop":
 			p.loop = true
 		case "--force", "-f":
@@ -538,5 +544,6 @@ TUI options:
   --remote <url>       Connect to an explicit remote daemon URL
   --no-start           Do not auto-start a local daemon if unreachable
   --stop-on-exit       Stop the daemon on TUI exit if started by this TUI
+  --theme <name>       Color theme: default|nord|gruvbox|tokyonight|catppuccin
 `)
 }

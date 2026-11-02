@@ -123,8 +123,20 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/v1/loop", s.handleLoop)
 	s.mux.HandleFunc("POST /api/v1/shutdown", s.handleShutdown)
 
+	s.mux.HandleFunc("POST /api/v1/seek", s.handleSeek)
+	s.mux.HandleFunc("POST /api/v1/queue/play", s.handleQueuePlay)
+	s.mux.HandleFunc("POST /api/v1/queue/remove", s.handleQueueRemove)
+	s.mux.HandleFunc("POST /api/v1/queue/move", s.handleQueueMove)
+	s.mux.HandleFunc("POST /api/v1/queue/clear", s.handleQueueClear)
+	s.mux.HandleFunc("POST /api/v1/queue/append", s.handleQueueAppend)
+	s.mux.HandleFunc("GET /api/v1/levels", s.handleLevels)
+	s.mux.HandleFunc("GET /api/v1/browse", s.handleBrowse)
+
 	s.mux.HandleFunc("POST /api/v1/playlists/create", s.handlePlaylistCreate)
 	s.mux.HandleFunc("POST /api/v1/playlists/play", s.handlePlaylistPlay)
+	s.mux.HandleFunc("GET /api/v1/playlists", s.handlePlaylistList)
+	s.mux.HandleFunc("GET /api/v1/playlists/tracks", s.handlePlaylistInspect)
+	s.mux.HandleFunc("DELETE /api/v1/playlists", s.handlePlaylistDelete)
 
 	s.mux.HandleFunc("GET /api/v1/aliases", s.handleAliasList)
 	s.mux.HandleFunc("PUT /api/v1/aliases/{name}", s.handleAliasSet)
@@ -165,6 +177,28 @@ type PlaylistPlayRequest struct {
 type AliasSetRequest struct {
 	Path         string `json:"path,omitempty"`
 	PlaylistPath string `json:"playlist_path,omitempty"`
+}
+
+// SeekRequest is the JSON body for POST /api/v1/seek.
+type SeekRequest struct {
+	PositionMs *int64 `json:"position_ms,omitempty"`
+	DeltaMs    *int64 `json:"delta_ms,omitempty"`
+}
+
+// IndexRequest is the JSON body for queue index operations.
+type IndexRequest struct {
+	Index int `json:"index"`
+}
+
+// MoveRequest is the JSON body for POST /api/v1/queue/move.
+type MoveRequest struct {
+	From int `json:"from"`
+	To   int `json:"to"`
+}
+
+// QueueAppendRequest is the JSON body for POST /api/v1/queue/append.
+type QueueAppendRequest struct {
+	Paths []string `json:"paths"`
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -322,6 +356,152 @@ func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
 	if s.opts.OnShutdown != nil {
 		go s.opts.OnShutdown()
 	}
+}
+
+func (s *Server) handleSeek(w http.ResponseWriter, r *http.Request) {
+	var req SeekRequest
+	if err := decodeRequiredJSON(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	if req.PositionMs == nil && req.DeltaMs == nil {
+		writeError(w, apperr.New(apperr.InvalidCommand, "provide position_ms or delta_ms"))
+		return
+	}
+	var (
+		st  engine.Status
+		err error
+	)
+	if req.PositionMs != nil {
+		st, err = s.player.SeekTo(*req.PositionMs)
+	} else {
+		st, err = s.player.SeekBy(*req.DeltaMs)
+	}
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+func (s *Server) handleQueuePlay(w http.ResponseWriter, r *http.Request) {
+	var req IndexRequest
+	if err := decodeRequiredJSON(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	st, err := s.player.PlayIndex(req.Index)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+func (s *Server) handleQueueRemove(w http.ResponseWriter, r *http.Request) {
+	var req IndexRequest
+	if err := decodeRequiredJSON(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	st, err := s.player.QueueRemove(req.Index)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+func (s *Server) handleQueueMove(w http.ResponseWriter, r *http.Request) {
+	var req MoveRequest
+	if err := decodeRequiredJSON(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	st, err := s.player.QueueMove(req.From, req.To)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+func (s *Server) handleQueueClear(w http.ResponseWriter, r *http.Request) {
+	if err := drainEmptyBody(r); err != nil {
+		writeError(w, err)
+		return
+	}
+	st, err := s.player.QueueClear()
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+func (s *Server) handleQueueAppend(w http.ResponseWriter, r *http.Request) {
+	var req QueueAppendRequest
+	if err := decodeRequiredJSON(r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	if len(req.Paths) == 0 {
+		writeError(w, apperr.New(apperr.InvalidCommand, "paths must not be empty"))
+		return
+	}
+	st, err := s.player.QueueAppend(req.Paths)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+func (s *Server) handleLevels(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, s.player.Levels())
+}
+
+func (s *Server) handleBrowse(w http.ResponseWriter, r *http.Request) {
+	res, err := s.player.Browse(r.URL.Query().Get("path"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handlePlaylistList(w http.ResponseWriter, _ *http.Request) {
+	list, err := s.player.PlaylistList()
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"playlists": list})
+}
+
+func (s *Server) handlePlaylistInspect(w http.ResponseWriter, r *http.Request) {
+	target := r.URL.Query().Get("target")
+	if strings.TrimSpace(target) == "" {
+		target = r.URL.Query().Get("path")
+	}
+	view, err := s.player.PlaylistInspect(target)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+func (s *Server) handlePlaylistDelete(w http.ResponseWriter, r *http.Request) {
+	target := r.URL.Query().Get("target")
+	if strings.TrimSpace(target) == "" {
+		target = r.URL.Query().Get("path")
+	}
+	if err := s.player.PlaylistRemove(target); err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"deleted": target})
 }
 
 func (s *Server) handlePlaylistCreate(w http.ResponseWriter, r *http.Request) {

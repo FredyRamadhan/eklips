@@ -80,7 +80,8 @@ go build -o eklips ./cmd/eklips
 | `--auth-token <tok>` | `EKLIPS_TOKEN` | *(empty)* | Bearer token required for HTTP/CLI/TUI clients |
 | `--allow-remote` | — | `false` | Allow binding to non-loopback address without `--auth-token` |
 | `--resume-on-start` | — | `false` | Restore playback as `playing` instead of `stopped` on startup |
-| `--media-root <dir>` | — | *(empty)* | Restrict playable files and playlists to `<dir>` |
+| `--media-root <dir>` | — | *(empty)* | Restrict playable files, playlists, and TUI browsing to `<dir>` |
+| `--theme <name>` | — | `default` | TUI palette: `default`, `nord`, `gruvbox`, `tokyonight`, `catppuccin` |
 
 ### Playback Controls
 
@@ -121,22 +122,33 @@ eklips playlist alias remove chill
 ## Terminal UI (`eklips tui`)
 
 ```
- eklips  •  http://127.0.0.1:8080   PLAYING 
+ eklips  •  http://127.0.0.1:8080   PLAYING   theme:nord
+ [1: Queue (3)]  [2: Files]  [3: Playlists (2)]
 
  Now Playing
-   01_overture.flac
+   The Cinematic Orchestra — To Build a Home (Ma Fleur)
    playlist: /music/symphony
-   ████████████████████░░░░░░░░░░░░░░░░░░░░  01:42 / 03:24
+   ███████████████░░░░░░░░░░░░░░░░░░░░░░░░  01:42 / 03:24
+   L: [██████████████░░░░░░]   -8.2 dB   R: [█████████████░░░░░░░]   -9.7 dB
 
-    Vol: 80%    Shuffle: OFF    Loop: ON 
+    Vol: 80%    Shuffle: OFF    Loop: ON
 
- Queue (3)
-  ▶  1. 01_overture.flac
-     2. 02_adagio.flac
-     3. 03_finale.flac
+ Queue (3)  filter: home
+ ❯▶  1. The Cinematic Orchestra — To Build a Home (Ma Fleur)
+     2. Ólafur Arnalds — Near Light (For Now I Am Winter)
+     3. Nils Frahm — Says (Spaces)
 
- space play/pause • s stop • n next • p prev • + vol+ • - vol- • m mute • r shuffle • l loop • ? help • q/Esc quit TUI • Q quit daemon
+ space play/pause · enter play · j/k move · h/l seek ±5s · [/] ±30s · x/d remove · J/K reorder · C clear · / filter · 1/2/3 view · ? help · q quit
 ```
+
+The TUI is a full terminal music player with three views:
+
+1. **Queue & Now Playing** — metadata-rich queue, cursor selection, reorder/remove,
+   inline fuzzy filter, progress bar, stereo VU meter.
+2. **File Browser** — navigate the daemon's media root (or cwd), preview ID3/Vorbis
+   metadata, play a file/folder directly (`Enter`), or append with `a`.
+3. **Playlists & Aliases** — load saved database playlists/aliases, inspect their
+   tracks, and delete them with confirmation.
 
 ### TUI Options
 
@@ -144,22 +156,40 @@ eklips playlist alias remove chill
 - `eklips tui --no-start`: Fail with `SERVICE_NOT_RUNNING` instead of auto-starting.
 - `eklips tui --stop-on-exit`: Stop the daemon when exiting the TUI, **only** if this TUI invocation auto-started it.
 - `eklips tui --remote http://host:8080 --auth-token <token>`: Connect to a remote or containerized daemon (never auto-starts). For plain HTTP over untrusted networks, use an SSH tunnel (`ssh -L 8080:127.0.0.1:8080 user@host`).
+- `eklips tui --theme <name>`: Select `default`, `nord`, `gruvbox`, `tokyonight`, or `catppuccin`.
+  Use `:theme <name>` at runtime to switch without restarting.
 
 ### TUI Keymap
 
 | Key | Action |
 | --- | --- |
+| `1` / `2` / `3`, `Tab` | Switch Queue / Files / Playlists view |
 | `space` | Play / Pause |
 | `s` | Stop |
 | `n` / `p` | Next / Previous track |
 | `+` / `-` | Volume up / down (step 5) |
 | `m` | Toggle mute |
 | `r` | Toggle shuffle |
-| `l` | Toggle loop |
-| `↑` / `k`, `↓` / `j` | Scroll queue |
+| `L` | Toggle loop |
+| `↑` / `k`, `↓` / `j` | Move cursor |
+| `g` / `G` | Jump to first / last item |
+| `Enter` | Play highlighted queue track, open folder, or load playlist |
+| `h` / `l`, `←` / `→` | Seek −5s / +5s |
+| `[` / `]` | Seek −30s / +30s |
+| `x` / `d` | Remove highlighted queue track (or delete playlist) |
+| `J` / `K` | Move queue track down / up |
+| `C` | Clear the queue (confirmation) |
+| `/` | Inline fuzzy filter (queue or file browser) |
+| `a` | Append highlighted file/folder to the queue |
+| `p` | Replace queue with highlighted file/folder and play |
+| `⌫` / `h` | Parent directory (Files view) |
+| `:` | Command line (`:theme`, `:seek`, `:open`, `:clear`, `:filter`, …) |
 | `?` | Toggle full help |
 | `q` / `Esc` | Quit TUI only (daemon keeps running) |
 | `Q` | Quit running daemon (prompts `y/N` confirmation) |
+
+Metadata is read natively from ID3v2 (MP3), Vorbis Comments (FLAC/OGG), and RIFF
+`INFO` chunks (WAV), with a filename fallback for untagged or FFmpeg-only files.
 
 ---
 
@@ -185,6 +215,17 @@ Full OpenAPI 3.0 specification: [`docs/openapi.yaml`](file:///home/frdn/Document
 | `POST /api/v1/shuffle` | Toggle shuffle |
 | `POST /api/v1/loop` | Toggle loop |
 | `POST /api/v1/shutdown` | Gracefully shut down the daemon |
+| `POST /api/v1/seek` | Seek (`{"position_ms":120000}` or `{"delta_ms":-5000}`) |
+| `GET /api/v1/levels` | Real-time stereo peak meter in dBFS |
+| `GET /api/v1/browse?path=...` | Directory listing with folders, audio files, and metadata |
+| `POST /api/v1/queue/play` | Jump to a queue track (`{"index":2}`) |
+| `POST /api/v1/queue/remove` | Remove a queue track (`{"index":2}`) |
+| `POST /api/v1/queue/move` | Reorder a queue track (`{"from":2,"to":0}`) |
+| `POST /api/v1/queue/clear` | Clear the queue and stop |
+| `POST /api/v1/queue/append` | Append files/directories (`{"paths":["/music/album"]}`) |
+| `GET /api/v1/playlists` | List saved playlists with track counts |
+| `GET /api/v1/playlists/tracks?target=...` | Inspect a saved playlist and its tracks |
+| `DELETE /api/v1/playlists?target=...` | Delete a saved playlist or alias |
 | `POST /api/v1/playlists/create` | Generate playlist JSON (`{"dir":"...","output":"...","force":false}`) |
 | `POST /api/v1/playlists/play` | Play playlist JSON or alias (`{"target":"...","loop":false}`) |
 | `GET /api/v1/aliases` | List saved aliases |

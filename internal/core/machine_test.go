@@ -109,6 +109,88 @@ func TestSingleFileTransitionsAndErrors(t *testing.T) {
 	}
 }
 
+func TestSelectRemoveMoveClearAndAppend(t *testing.T) {
+	m := NewMachine(1)
+	src := Source{
+		Type:   Playlist,
+		Path:   "/music",
+		Name:   "music",
+		Tracks: []string{"/a", "/b", "/c", "/d"},
+	}
+	if _, err := m.Load(src, false); err != nil {
+		t.Fatal(err)
+	}
+	if eff, err := m.SelectIndex(2); err != nil || eff != EffectStart {
+		t.Fatalf("SelectIndex: eff=%v err=%v", eff, err)
+	}
+	if m.TrackIndex() != 2 || m.CurrentTrack() != "/c" {
+		t.Fatalf("after select: index=%d track=%s", m.TrackIndex(), m.CurrentTrack())
+	}
+	// Removing a non-current track keeps the current selection.
+	if eff, err := m.RemoveTrack(0); err != nil || eff != EffectNone {
+		t.Fatalf("RemoveTrack non-current: eff=%v err=%v", eff, err)
+	}
+	if m.TrackIndex() != 1 || m.CurrentTrack() != "/c" {
+		t.Fatalf("after remove non-current: index=%d track=%s", m.TrackIndex(), m.CurrentTrack())
+	}
+	// Moving the current track preserves its identity.
+	if _, err := m.MoveTrack(1, 2); err != nil {
+		t.Fatal(err)
+	}
+	if m.CurrentTrack() != "/c" {
+		t.Fatalf("after move: current=%s tracks=%v", m.CurrentTrack(), m.Snapshot().Source.Tracks)
+	}
+	tracks := m.Snapshot().Source.Tracks
+	if len(tracks) != 3 || tracks[2] != "/c" {
+		t.Fatalf("unexpected order after move: %v", tracks)
+	}
+	// Removing the current track advances to the next.
+	if eff, err := m.RemoveTrack(m.TrackIndex()); err != nil || eff != EffectStart {
+		t.Fatalf("RemoveTrack current: eff=%v err=%v", eff, err)
+	}
+	if m.TrackIndex() < 0 || m.TrackIndex() >= len(m.Snapshot().Source.Tracks) {
+		t.Fatalf("bad index after removing current: %d", m.TrackIndex())
+	}
+	// Append converts to a playlist queue and adds tracks.
+	if _, err := m.AppendTracks([]string{"/e", "/f"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(m.Snapshot().Source.Tracks); got != 4 {
+		t.Fatalf("after append: %d tracks", got)
+	}
+	// Clear empties and stops.
+	if eff := m.Clear(); eff != EffectStop {
+		t.Fatalf("Clear effect: %v", eff)
+	}
+	if m.Loaded() || m.State() != Stopped {
+		t.Fatalf("expected empty stopped machine, loaded=%v state=%s", m.Loaded(), m.State())
+	}
+}
+
+func TestAppendToEmptyQueueStartsPlaying(t *testing.T) {
+	m := NewMachine(1)
+	eff, err := m.AppendTracks([]string{"/a", "/b"})
+	if err != nil || eff != EffectStart {
+		t.Fatalf("AppendTracks: eff=%v err=%v", eff, err)
+	}
+	if m.State() != Playing || m.CurrentTrack() != "/a" || len(m.Snapshot().Source.Tracks) != 2 {
+		t.Fatalf("state=%s current=%s tracks=%d", m.State(), m.CurrentTrack(), len(m.Snapshot().Source.Tracks))
+	}
+}
+
+func TestSelectIndexOutOfRange(t *testing.T) {
+	m := NewMachine(1)
+	if _, err := m.SelectIndex(0); !apperr.Is(err, apperr.NoMediaLoaded) {
+		t.Fatalf("got %v, want NO_MEDIA_LOADED", err)
+	}
+	if _, err := m.Load(Source{Type: Playlist, Tracks: []string{"/a"}}, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.SelectIndex(2); !apperr.Is(err, apperr.InvalidCommand) {
+		t.Fatalf("got %v, want INVALID_COMMAND", err)
+	}
+}
+
 func TestPlaylistNavigationShuffleLoopAndVolume(t *testing.T) {
 	m := NewMachine(99)
 	tracks := []string{"/a/1.wav", "/a/2.wav", "/a/3.wav", "/a/4.wav"}

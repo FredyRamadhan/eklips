@@ -18,8 +18,8 @@ import (
 )
 
 type captureOutput struct {
-	mu     sync.Mutex
-	buf    bytes.Buffer
+	mu      sync.Mutex
+	buf     bytes.Buffer
 	flushes int
 }
 
@@ -282,6 +282,147 @@ func TestCoalescedPersistenceAndDeviceChangePause(t *testing.T) {
 	eng.OnDeviceChange("headphones unplugged")
 	if eng.Status().State != core.Paused {
 		t.Fatalf("expected Paused after OnDeviceChange, got %s", eng.Status().State)
+	}
+}
+
+func TestSeekingForwardBackwardAndPastEnd(t *testing.T) {
+	dir := t.TempDir()
+	const rate = 44100
+	p1 := filepath.Join(dir, "01_a.wav")
+	p2 := filepath.Join(dir, "02_b.wav")
+	if err := audio.WriteSineWAV(p1, rate, rate*2, 440); err != nil {
+		t.Fatal(err)
+	}
+	if err := audio.WriteSineWAV(p2, rate, rate*3, 660); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := New(Options{Sink: sink.KindNull, CustomOutput: &captureOutput{}, SampleRate: rate, Unpaced: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	if _, err := eng.Play(dir, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Pause(); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := eng.SeekTo(1200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.PositionMs < 1150 || st.PositionMs > 1260 {
+		t.Fatalf("SeekTo(1200): position=%d", st.PositionMs)
+	}
+	st, err = eng.SeekBy(-500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.PositionMs < 650 || st.PositionMs > 760 {
+		t.Fatalf("Seek(-500): position=%d", st.PositionMs)
+	}
+	// Seeking past the end advances to the next track.
+	st, err = eng.SeekBy(10000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.TrackIndex != 1 || st.PositionMs > 100 {
+		t.Fatalf("seek past end: index=%d pos=%d duration=%d", st.TrackIndex, st.PositionMs, st.DurationMs)
+	}
+}
+
+func TestQueueMutationsAndAppend(t *testing.T) {
+	dir := t.TempDir()
+	const rate = 22050
+	var paths []string
+	for i, name := range []string{"01_a.wav", "02_b.wav", "03_c.wav"} {
+		p := filepath.Join(dir, name)
+		if err := audio.WriteSineWAV(p, rate, rate, 200+float64(i)*100); err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, p)
+	}
+	eng, err := New(Options{Sink: sink.KindNull, CustomOutput: &captureOutput{}, SampleRate: rate, Unpaced: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	if _, err := eng.Play(dir, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Pause(); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := eng.PlayIndex(2); err != nil || st.TrackIndex != 2 {
+		t.Fatalf("PlayIndex: st=%+v err=%v", st, err)
+	}
+	// Removing a non-current track keeps the current track loaded.
+	st, err := eng.QueueRemove(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.TrackIndex != 1 || len(eng.Queue().Tracks) != 2 {
+		t.Fatalf("after remove: index=%d tracks=%d", st.TrackIndex, len(eng.Queue().Tracks))
+	}
+	// Reordering preserves the current track.
+	st, err = eng.QueueMove(1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.TrackIndex != 0 || len(eng.Queue().Tracks) != 2 {
+		t.Fatalf("after move: index=%d", st.TrackIndex)
+	}
+	// Append a new file to the active queue.
+	st, err = eng.QueueAppend([]string{paths[0]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(eng.Queue().Tracks) != 3 {
+		t.Fatalf("after append: %d tracks", len(eng.Queue().Tracks))
+	}
+	// Clear stops and empties.
+	st, err = eng.QueueClear()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(eng.Queue().Tracks) != 0 || st.State != core.Stopped {
+		t.Fatalf("after clear: tracks=%d state=%s", len(eng.Queue().Tracks), st.State)
+	}
+}
+
+func TestBrowseAndMetadata(t *testing.T) {
+	dir := t.TempDir()
+	if err := audio.WriteSineWAV(filepath.Join(dir, "01. Artist - Title.wav"), 22050, 22050, 440); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := New(Options{Sink: sink.KindNull, SampleRate: 22050, MediaRoot: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	res, err := eng.Browse("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Path != dir || len(res.Entries) != 2 {
+		t.Fatalf("browse: path=%s entries=%d %+v", res.Path, len(res.Entries), res.Entries)
+	}
+	if !res.Entries[0].IsDir || res.Entries[0].Name != "sub" {
+		t.Fatalf("expected directory first: %+v", res.Entries[0])
+	}
+	file := res.Entries[1]
+	if !file.Audio || file.Metadata.Artist != "Artist" || file.Metadata.Title != "Title" {
+		t.Fatalf("unexpected file metadata: %+v", file)
 	}
 }
 
