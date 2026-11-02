@@ -226,7 +226,7 @@ func New(opts Options) (*Engine, error) {
 		out = opts.CustomOutput
 		hasClock = opts.Sink.HasDevice()
 	} else if opts.Sink.HasDevice() {
-		dev, err := sink.OpenDevice(f, 200*time.Millisecond)
+		dev, err := sink.OpenDevice(f, sink.DefaultDeviceBuffer)
 		if err != nil {
 			_ = lock.Release()
 			return nil, err
@@ -326,6 +326,8 @@ func (e *Engine) restoreFromStore() {
 		}
 		e.cur = tr
 		e.durFrames.Store(max(0, tr.TotalFrames()))
+		e.primeDevice()
+		e.out.Resume()
 	}
 }
 
@@ -721,12 +723,7 @@ func (e *Engine) stepAudio() {
 	}
 	samples := filled * 2
 	for i := 0; i < samples; i++ {
-		v := e.fbuf[i] * gain
-		if v > 1.0 {
-			v = 1.0
-		} else if v < -1.0 {
-			v = -1.0
-		}
+		v := softLimit(e.fbuf[i] * gain)
 		s := int16(math.Round(float64(v * 32767.0)))
 		binary.LittleEndian.PutUint16(e.pcm[i*2:], uint16(s))
 	}
@@ -842,6 +839,37 @@ func (e *Engine) emitError(err error) {
 	e.bus.Publish(events.Error, ae)
 }
 
+// softLimit applies a C¹-continuous rational soft-knee peak limiter above |v| > 0.90.
+// Signals within [-0.90, 0.90] are 100% linear (bit-exact); hot inter-sample peaks
+// from lossy decoders or heavy bass transients are smoothly compressed asymptotically
+// toward ±1.0 rather than sheared into square waves by hard digital clipping.
+func softLimit(v float32) float32 {
+	const knee = 0.90
+	const head = 1.0 - knee // 0.10
+	switch {
+	case v > knee:
+		d := v - knee
+		return knee + (head*d)/(head+d)
+	case v < -knee:
+		d := -v - knee
+		return -(knee + (head*d)/(head+d))
+	default:
+		return v
+	}
+}
+
+// primeDevice pre-fills ~160 ms (8 chunks) into the hardware output ring buffer
+// before unpausing the audio device so the OS callback has an immediate cushion.
+func (e *Engine) primeDevice() {
+	if !e.hasClock || e.opts.CustomOutput != nil {
+		return
+	}
+	const preRollChunks = 8
+	for i := 0; i < preRollChunks && e.cur != nil && e.machine.State() == core.Playing; i++ {
+		e.stepAudio()
+	}
+}
+
 func (e *Engine) startCurrentTrack() error {
 	e.closePipeline()
 	path := e.machine.CurrentTrack()
@@ -849,7 +877,7 @@ func (e *Engine) startCurrentTrack() error {
 	if err != nil {
 		return err
 	}
-	if err := tr.Prebuffer(e.chunkFrames); err != nil {
+	if err := tr.Prebuffer(e.chunkFrames * 8); err != nil {
 		_ = tr.Close()
 		return err
 	}
@@ -857,7 +885,10 @@ func (e *Engine) startCurrentTrack() error {
 	e.posFrames.Store(0)
 	e.durFrames.Store(max(0, tr.TotalFrames()))
 	e.out.Flush()
-	e.out.Resume()
+	if e.machine.State() == core.Playing {
+		e.primeDevice()
+		e.out.Resume()
+	}
 	e.pacer.Reset()
 	return nil
 }
@@ -955,7 +986,7 @@ func (e *Engine) loadAndStart(src core.Source, loop bool, persistPlaylist bool) 
 	for i, p := range src.Tracks {
 		tr, err := audio.Open(p, e.sampleRate)
 		if err == nil {
-			err = tr.Prebuffer(e.chunkFrames)
+			err = tr.Prebuffer(e.chunkFrames * 8)
 			if err != nil {
 				_ = tr.Close()
 				tr = nil
@@ -999,6 +1030,7 @@ func (e *Engine) loadAndStart(src core.Source, loop bool, persistPlaylist bool) 
 		e.durFrames.Store(max(0, firstTrack.TotalFrames()))
 		e.lastErr = ""
 		e.out.Flush()
+		e.primeDevice()
 		e.out.Resume()
 		e.pacer.Reset()
 		e.updateSnapshots()

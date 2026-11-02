@@ -285,6 +285,30 @@ func TestCoalescedPersistenceAndDeviceChangePause(t *testing.T) {
 	}
 }
 
+func TestSoftLimitPeakLimiter(t *testing.T) {
+	// 1. Signals within [-0.90, 0.90] must be 100% bit-exact linear.
+	for _, v := range []float32{-0.90, -0.50, -0.10, 0.0, 0.10, 0.50, 0.90} {
+		if got := softLimit(v); got != v {
+			t.Fatalf("softLimit(%v) = %v, want exact %v", v, got, v)
+		}
+	}
+
+	// 2. Signals above the knee (0.90) must be smoothly compressed, monotonic,
+	// and strictly bounded within (-1.0, 1.0) without brick-wall hard clipping.
+	prev := softLimit(0.90)
+	for _, v := range []float32{0.95, 1.00, 1.10, 1.25, 1.50, 2.00} {
+		pos := softLimit(v)
+		neg := softLimit(-v)
+		if pos <= prev || pos >= 1.0 {
+			t.Fatalf("softLimit(%v) = %v, want strictly in (%v, 1.0)", v, pos, prev)
+		}
+		if neg != -pos {
+			t.Fatalf("softLimit(-%v) = %v, want symmetric -%v", v, neg, pos)
+		}
+		prev = pos
+	}
+}
+
 func BenchmarkGaplessSplice(b *testing.B) {
 	dir := b.TempDir()
 	const rate = 44100
