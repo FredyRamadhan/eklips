@@ -80,6 +80,54 @@ func TestBroadcasterFanOutAndSlowConsumerEviction(t *testing.T) {
 	}
 }
 
+func TestRingPartialReadWithoutZeroPaddingAndWakeup(t *testing.T) {
+	r := NewRing(1024)
+	closed := make(chan struct{})
+
+	// Write 16 bytes (4 stereo 16-bit frames) into the ring.
+	in := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	if err := r.Write(in, closed); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	// Fill destination buffer with sentinel bytes (0xAA) and request 64 bytes.
+	// Read must return n == 16 and MUST NOT overwrite dst[16:] with zeros!
+	dst := make([]byte, 64)
+	for i := range dst {
+		dst[i] = 0xAA
+	}
+	n, err := r.Read(dst, closed, 4)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if n != len(in) {
+		t.Fatalf("Read n = %d, want %d", n, len(in))
+	}
+	for i := 0; i < n; i++ {
+		if dst[i] != in[i] {
+			t.Fatalf("dst[%d] = %d, want %d", i, dst[i], in[i])
+		}
+	}
+	for i := n; i < len(dst); i++ {
+		if dst[i] != 0xAA {
+			t.Fatalf("dst[%d] was zero-padded (%#x), expected untouched sentinel 0xAA", i, dst[i])
+		}
+	}
+
+	// Verify an empty ring wakes up promptly when the producer writes data.
+	go func() {
+		time.Sleep(2 * time.Millisecond)
+		_ = r.Write([]byte{21, 22, 23, 24}, closed)
+	}()
+	n2, err := r.Read(dst, closed, 4)
+	if err != nil {
+		t.Fatalf("Read wakeup: %v", err)
+	}
+	if n2 != 4 || dst[0] != 21 || dst[3] != 24 {
+		t.Fatalf("Read wakeup got n=%d (%v), want 4 ([21 22 23 24])", n2, dst[:n2])
+	}
+}
+
 func BenchmarkBroadcasterFanOut10(b *testing.B) {
 	f := Format{SampleRate: 44100, Channels: 2}
 	chunkBytes := 882 * 4

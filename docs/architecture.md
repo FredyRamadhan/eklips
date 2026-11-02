@@ -87,8 +87,8 @@ Queue semantics:
 flowchart LR
     D["Decoder (native rate/channels)"] --> T["Gapless trim (delay/padding)"]
     T --> R["Resampler → output rate, stereo float32"]
-    R --> A["Actor loop: gain (atomic) → int16"]
-    A --> DS["Device sink ring (≈200 ms)"]
+    R --> A["Actor loop: gain + soft-knee limiter → int16"]
+    A --> DS["Device sink ring (1000 ms) + 100 ms HW buffer"]
     A --> B["Broadcaster"]
     B --> L1["Listener 1 (bounded chan)"]
     B --> L2["Listener N (bounded chan)"]
@@ -97,7 +97,7 @@ flowchart LR
 - **Actor model.** One goroutine (the *engine loop*) owns the `core.Machine`, the current decoder, and the prefetched decoder. Commands arrive over a channel and get a reply; readers get lock-free snapshots via `atomic.Pointer`. There is no lock in the audio path.
 - **Fixed output format.** 44 100 Hz (configurable via `--sample-rate`), stereo, signed 16-bit little-endian. Tracks at other rates are resampled (linear) per track so splices are sample-accurate in the output domain.
 - **Chunking.** 20 ms chunks (882 frames at 44.1 kHz). Buffers are preallocated; stream chunks come from a `sync.Pool` and are reference-counted across listeners.
-- **Clock.** The device sink paces the loop (blocking ring write). Without a device, a wall-clock pacer paces the loop at 1× so HTTP listeners receive real time audio.
+- **Clock & Pre-roll.** The device sink paces the loop (blocking ring write into a 1000 ms SPSC ring feeding a 100 ms `oto` hardware buffer, with ~160 ms pre-roll priming before unpausing). Without a device, a wall-clock pacer paces the loop at 1× so HTTP listeners receive real time audio.
 - **Gapless.** When less than 10 s of the current track remains, a helper goroutine opens the next track (chosen with current shuffle/loop state) and pre-decodes ~0.5 s. On EOF the remainder of the current chunk is filled from the next track — a sample-accurate splice with no output reset. Index/metadata events are emitted at the splice. Prefetch is one track at most; any command that changes queue, shuffle, or loop bumps a generation counter that invalidates the prefetch. Undecodable tracks are skipped with an `error` event; if none remain, playback stops.
 - **Encoder delay/padding.** MP3: LAME/Xing tag delay+padding (plus the 529-sample decoder delay) trimmed. FLAC/WAV are exact. Vorbis end-trim is handled by the decoder's granule positions. AAC via FFmpeg relies on FFmpeg's iTunSMPB/edit-list handling.
 - **Slow consumers.** Each HTTP listener has a bounded channel (2 s of audio). If full, the listener is evicted; the decoder never blocks on a listener.
@@ -136,7 +136,7 @@ Event types: `snapshot`, `state`, `track`, `queue`, `volume`, `mute`, `shuffle`,
 | --- | --- |
 | Stream listeners at 1× without dropouts | ≥ 10 (default max 32) |
 | Idle CPU (stopped, no listeners, no TUI) | ≈ 0 — no timers running |
-| Memory | bounded: device ring 200 ms, 2 s per listener, ≤1 prefetched track (0.5 s prebuffer + decoder state), queue ≤ 10 000 tracks |
+| Memory | bounded: device ring 1000 ms (~176 KiB), 2 s per listener, ≤1 prefetched track (0.5 s prebuffer + decoder state), queue ≤ 10 000 tracks |
 | DB writes during steady playback | ≤ 1 per 5 s |
 | Decode throughput (WAV/FLAC) | ≥ 50× real time on one core |
 | Gapless splice | 0 inserted samples; < 1 chunk of extra work |
